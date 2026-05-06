@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from collections import OrderedDict
 from typing import Any, Callable, List, Sequence, TypeVar
 
 import numpy as np
@@ -132,6 +133,8 @@ class FeatureExtractor:
         self.model = self._from_pretrained_with_retry(self._load_chinese_clip_model, what="model")
         self.model.to(self.device)
         self.model.eval()
+        self._text_cache: OrderedDict[str, np.ndarray] = OrderedDict()
+        self._text_cache_max_size = 256
 
     def _load_chinese_clip_model(self) -> ChineseCLIPModel:
         """
@@ -186,25 +189,43 @@ class FeatureExtractor:
         return features / denom
 
     @torch.inference_mode()
+    def _get_text_feature_tensor(self, text: str) -> torch.Tensor:
+        inputs = self.processor(text=[text], padding=True, return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        raw = self.model.get_text_features(**inputs)
+        return self._l2_normalize(_extract_clip_feature_tensor(raw, modality="text"))
+
+    @torch.inference_mode()
+    def _get_image_feature_tensor(self, image: Image.Image) -> torch.Tensor:
+        inputs = self.processor(images=image, return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        raw = self.model.get_image_features(**inputs)
+        return self._l2_normalize(_extract_clip_feature_tensor(raw, modality="image"))
+
+    @torch.inference_mode()
     def get_text_feature(self, text: str) -> np.ndarray:
         """
         单条文本 -> L2 归一化向量 (1, D)，float32 numpy。
         """
-        inputs = self.processor(text=[text], padding=True, return_tensors="pt")
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        raw = self.model.get_text_features(**inputs)
-        feats = self._l2_normalize(_extract_clip_feature_tensor(raw, modality="text"))
-        return feats.detach().cpu().numpy().astype(np.float32)
+        key = text.strip()
+        cached = self._text_cache.get(key)
+        if cached is not None:
+            self._text_cache.move_to_end(key)
+            return cached.copy()
+
+        feats = self._get_text_feature_tensor(key).detach().cpu().numpy().astype(np.float32)
+        self._text_cache[key] = feats
+        self._text_cache.move_to_end(key)
+        if len(self._text_cache) > self._text_cache_max_size:
+            self._text_cache.popitem(last=False)
+        return feats.copy()
 
     @torch.inference_mode()
     def get_image_feature(self, image: Image.Image) -> np.ndarray:
         """
         单张 PIL 图像 -> L2 归一化向量 (1, D)。
         """
-        inputs = self.processor(images=image, return_tensors="pt")
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        raw = self.model.get_image_features(**inputs)
-        feats = self._l2_normalize(_extract_clip_feature_tensor(raw, modality="image"))
+        feats = self._get_image_feature_tensor(image)
         return feats.detach().cpu().numpy().astype(np.float32)
 
     @torch.inference_mode()
@@ -222,8 +243,9 @@ class FeatureExtractor:
         alpha = float(alpha)
         alpha = max(0.0, min(1.0, alpha))
 
-        img_t = torch.from_numpy(self.get_image_feature(image)).to(self.device)
-        txt_t = torch.from_numpy(self.get_text_feature(text)).to(self.device)
+        img_t = self._get_image_feature_tensor(image)
+        txt_np = self.get_text_feature(text)
+        txt_t = torch.from_numpy(txt_np).to(self.device)
         fused = alpha * img_t + (1.0 - alpha) * txt_t
         fused = self._l2_normalize(fused)
         return fused.detach().cpu().numpy().astype(np.float32)

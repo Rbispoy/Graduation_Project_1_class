@@ -31,14 +31,22 @@
   }
   </script>
   <style>
-    body { font-family: Inter, system-ui, sans-serif; }
-    /* 自定义滚动条，贴合深色主题 */
+    body {
+      font-family: Inter, system-ui, sans-serif;
+      background-image:
+        linear-gradient(135deg, rgba(15, 23, 42, 0.82), rgba(30, 41, 59, 0.78)),
+        url('https://images.unsplash.com/photo-1555529771-35a0d80b7d84?auto=format&fit=crop&w=1920&q=80');
+      background-size: cover;
+      background-position: center;
+      background-attachment: fixed;
+    }
+    /* 自定义滚动条，贴合新主题 */
     ::-webkit-scrollbar { width: 8px; height: 8px; }
-    ::-webkit-scrollbar-track { background: #12121a; }
+    ::-webkit-scrollbar-track { background: #0f172a; }
     ::-webkit-scrollbar-thumb { background: #3f3f55; border-radius: 4px; }
   </style>
 </head>
-<body class="bg-ink-950 text-slate-200 min-h-screen antialiased">
+<body class="text-slate-200 min-h-screen antialiased">
   <div id="app"></div>
 
   <!-- Vue 3 运行时 + 组合式 API（ESM） -->
@@ -66,6 +74,7 @@
         const resultsVersion = ref(0);
         const thumbUrl = ref('');
         const fileObj = ref(null);
+        const perf = ref(null);
 
         /** masonry 组件需要稳定 key：在每条后端记录上仅追加 _key，保留 image_url / score 等原始字段名 */
         const items = computed(() =>
@@ -103,6 +112,7 @@
 
         async function doSearch() {
           errorMsg.value = '';
+          perf.value = null;
           /* 每次发起检索前先清空结果，避免 masonry 在旧/空数据切换时出现异常 vnode */
           results.value = [];
           await nextTick();
@@ -113,7 +123,8 @@
             if (fileObj.value) fd.append('file', fileObj.value);
             fd.append('alpha', String(alpha.value));
 
-            const res = await fetch('/api/search', { method: 'POST', body: fd });
+            fd.append('benchmark', 'true');
+            const res = await fetch('./api/search', { method: 'POST', body: fd });
             const payload = await res.json().catch(() => ({}));
             if (!res.ok) {
               const d = payload.detail;
@@ -131,6 +142,7 @@
 
             /* 数据完整就绪后再写入；version++ 强制瀑布流实例重建 */
             results.value = rows.slice();
+            perf.value = payload.perf || null;
             resultsVersion.value += 1;
             await nextTick();
             console.log('[search] results.value 已替换为 payload.results，条数=', results.value.length, 'version=', resultsVersion.value);
@@ -149,6 +161,7 @@
           items,
           results,
           resultsVersion,
+          perf,
           thumbUrl,
           logCardItem,
           onFileChange,
@@ -173,7 +186,7 @@
 
           <!-- 大号搜索区：左图右文 -->
           <section
-            class="rounded-3xl border border-white/10 bg-gradient-to-br from-ink-900/90 to-ink-950/90
+            class="rounded-3xl border border-white/20 bg-gradient-to-br from-slate-900/75 to-slate-950/70
                    shadow-[0_0_0_1px_rgba(255,255,255,0.04),0_24px_80px_rgba(0,0,0,0.55)] backdrop-blur-xl p-6 sm:p-10"
           >
             <div class="grid lg:grid-cols-2 gap-8 lg:gap-12 items-stretch">
@@ -190,7 +203,7 @@
                 </div>
                 <label
                   class="relative flex flex-1 min-h-[220px] cursor-pointer group rounded-2xl border border-dashed border-white/15
-                         hover:border-violet-500/50 bg-ink-950/40 overflow-hidden transition"
+                         hover:border-violet-500/50 bg-slate-950/40 overflow-hidden transition"
                 >
                   <input id="file-input" type="file" accept="image/*" class="hidden" @change="onFileChange" />
                   <div v-if="!thumbUrl" class="m-auto text-center px-6 py-12">
@@ -216,7 +229,7 @@
                     v-model="queryText"
                     rows="6"
                     placeholder="例如：宽松纯棉短袖、复古牛仔裤、儿童运动鞋…"
-                    class="w-full flex-1 min-h-[160px] rounded-2xl bg-ink-950/60 border border-white/10 px-4 py-3 text-sm
+                    class="w-full flex-1 min-h-[160px] rounded-2xl bg-slate-950/55 border border-white/15 px-4 py-3 text-sm
                            text-slate-100 placeholder:text-slate-600 focus:outline-none focus:ring-2 focus:ring-violet-500/40 resize-y"
                   ></textarea>
                 </div>
@@ -245,6 +258,27 @@
 
                 <p v-if="errorMsg" class="text-sm text-rose-400">{{ errorMsg }}</p>
               </div>
+            </div>
+          </section>
+
+          <section v-if="perf" class="mt-6 grid sm:grid-cols-2 lg:grid-cols-4 gap-4">
+            <div class="rounded-2xl border border-white/15 bg-slate-900/60 backdrop-blur-md p-4">
+              <p class="text-xs text-slate-400">特征编码</p>
+              <p class="text-xl font-semibold text-cyan-300 mt-1">{{ perf.embed_ms }} ms</p>
+            </div>
+            <div class="rounded-2xl border border-white/15 bg-slate-900/60 backdrop-blur-md p-4">
+              <p class="text-xs text-slate-400">FAISS 检索</p>
+              <p class="text-xl font-semibold text-emerald-300 mt-1">{{ perf.faiss_ms }} ms</p>
+            </div>
+            <div class="rounded-2xl border border-white/15 bg-slate-900/60 backdrop-blur-md p-4">
+              <p class="text-xs text-slate-400">端到端总耗时</p>
+              <p class="text-xl font-semibold text-violet-300 mt-1">{{ perf.total_ms }} ms</p>
+            </div>
+            <div class="rounded-2xl border border-white/15 bg-slate-900/60 backdrop-blur-md p-4">
+              <p class="text-xs text-slate-400">相对暴力检索加速</p>
+              <p class="text-xl font-semibold text-fuchsia-300 mt-1">
+                {{ perf.speedup_vs_bruteforce ? (perf.speedup_vs_bruteforce + 'x') : 'N/A' }}
+              </p>
             </div>
           </section>
 

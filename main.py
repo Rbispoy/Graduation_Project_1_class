@@ -31,6 +31,7 @@ os.environ["TORCH_FORCE_SAFE_LOAD"] = "0"
 
 import json
 import logging
+import time
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Optional
@@ -51,12 +52,17 @@ from core.feature_extractor import FeatureExtractor
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+# 关闭第三方依赖的高频网络探测日志，仅保留告警/错误。
+# 例如 httpx 对 HF 镜像发起的 HEAD/GET 探测通常是正常行为，但会刷屏。
+for noisy_name in ("httpx", "httpcore", "huggingface_hub", "urllib3"):
+    logging.getLogger(noisy_name).setLevel(logging.WARNING)
 
 ROOT = Path(__file__).resolve().parent
 DATASET_DIR = ROOT / "dataset"
 IMAGES_DIR = DATASET_DIR / "images"
 # 与 StaticFiles 挂载路径一致；API 返回的 image_url 必须为「挂载前缀 + 文件名」
-IMAGES_URL_PREFIX = "/images"
+IMAGES_URL_PREFIX = os.getenv("IMAGES_URL_PREFIX", "images").strip("/") or "images"
+IMAGES_ROUTE = f"/{IMAGES_URL_PREFIX}"
 METADATA_PATH = DATASET_DIR / "metadata.json"
 INDEX_PATH = DATASET_DIR / "ecommerce.index"
 ID_MAP_PATH = DATASET_DIR / "index_ids.json"
@@ -87,6 +93,7 @@ _extractor: Optional[FeatureExtractor] = None
 _index: Optional[faiss.Index] = None
 _id_order: list[str] = []
 _meta_by_id: dict[str, dict[str, Any]] = {}
+_flat_vectors: Optional[np.ndarray] = None
 _TOP_K = 20
 
 
@@ -99,7 +106,7 @@ def _load_json_list(path: Path) -> list:
 
 def load_resources() -> None:
     """启动时加载模型、索引与元数据（内存占用：索引 + 元数据字典）。"""
-    global _extractor, _index, _id_order, _meta_by_id
+    global _extractor, _index, _id_order, _meta_by_id, _flat_vectors
 
     if not INDEX_PATH.exists() or not ID_MAP_PATH.exists():
         raise RuntimeError(
@@ -111,6 +118,14 @@ def load_resources() -> None:
 
     logger.info("加载 FAISS 索引 …")
     _index = faiss.read_index(str(INDEX_PATH))
+    _flat_vectors = None
+    if isinstance(_index, faiss.IndexFlatIP):
+        try:
+            xb_ptr = _index.get_xb()
+            _flat_vectors = faiss.rev_swig_ptr(xb_ptr, _index.ntotal * _index.d).reshape(_index.ntotal, _index.d)
+            logger.info("已加载扁平向量矩阵用于基线对比，shape=%s", _flat_vectors.shape)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("构建暴力检索基线矩阵失败，已跳过 benchmark 对比：%s", exc)
 
     with ID_MAP_PATH.open(encoding="utf-8") as f:
         _id_order = json.load(f)
@@ -137,12 +152,12 @@ def _public_image_url(image_file: str, *, item_id: str) -> str:
     if not name:
         name = f"{item_id}.jpg"
     safe = quote(name, safe="")
-    return f"{IMAGES_URL_PREFIX}/{safe}"
+    return f"./{IMAGES_URL_PREFIX}/{safe}"
 
 
 # 必须先确保目录存在再挂载，否则启动时若文件夹尚未创建会导致整条 /images 路由丢失、前端永久裂图
 IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-app.mount(IMAGES_URL_PREFIX, StaticFiles(directory=str(IMAGES_DIR)), name="images")
+app.mount(IMAGES_ROUTE, StaticFiles(directory=str(IMAGES_DIR)), name="images")
 
 
 @app.get("/")
@@ -171,10 +186,12 @@ async def _read_upload_image(file: UploadFile | None) -> Optional[Image.Image]:
     return Image.open(BytesIO(data)).convert("RGB")
 
 
-def _search_vector(vec: np.ndarray) -> list[dict[str, Any]]:
+def _search_vector(vec: np.ndarray) -> tuple[list[dict[str, Any]], float]:
     assert _index is not None and _extractor is not None
     q = np.ascontiguousarray(vec.astype(np.float32), dtype=np.float32)
+    t0 = time.perf_counter()
     scores, indices = _index.search(q, _TOP_K)
+    faiss_ms = (time.perf_counter() - t0) * 1000.0
 
     results: list[dict[str, Any]] = []
     for score, idx in zip(scores[0].tolist(), indices[0].tolist()):
@@ -190,7 +207,18 @@ def _search_vector(vec: np.ndarray) -> list[dict[str, Any]]:
                 "image_url": _public_image_url(str(image_file), item_id=str(item_id)),
             }
         )
-    return results
+    return results, faiss_ms
+
+
+def _brute_force_topk_ms(vec: np.ndarray) -> Optional[float]:
+    """NumPy 暴力内积基线耗时，仅用于答辩/调优对比。"""
+    if _flat_vectors is None:
+        return None
+    q = np.ascontiguousarray(vec.astype(np.float32), dtype=np.float32)
+    t0 = time.perf_counter()
+    sims = _flat_vectors @ q[0]
+    _ = np.argpartition(-sims, _TOP_K - 1)[:_TOP_K]
+    return (time.perf_counter() - t0) * 1000.0
 
 
 @app.post("/api/search")
@@ -198,6 +226,7 @@ async def api_search(
     query: Optional[str] = Form(None),
     file: UploadFile | None = File(None),
     alpha: float = Form(0.6),
+    benchmark: bool = Form(False),
 ) -> dict[str, Any]:
     """
     多模态检索：根据表单字段自动选择 文本 / 图像 / 联合 查询向量。
@@ -210,6 +239,7 @@ async def api_search(
 
     assert _extractor is not None
 
+    t_start = time.perf_counter()
     if text is not None and image is not None:
         vec = _extractor.get_joint_feature(image, text, alpha=alpha)
     elif text is not None:
@@ -217,9 +247,21 @@ async def api_search(
     else:
         assert image is not None
         vec = _extractor.get_image_feature(image)
+    embed_ms = (time.perf_counter() - t_start) * 1000.0
 
-    hits = _search_vector(vec)
-    return {"results": hits, "top_k": len(hits)}
+    hits, faiss_ms = _search_vector(vec)
+    total_ms = (time.perf_counter() - t_start) * 1000.0
+    perf: dict[str, Any] = {
+        "embed_ms": round(embed_ms, 2),
+        "faiss_ms": round(faiss_ms, 2),
+        "total_ms": round(total_ms, 2),
+    }
+    if benchmark:
+        brute_ms = _brute_force_topk_ms(vec)
+        if brute_ms is not None:
+            perf["bruteforce_ms"] = round(brute_ms, 2)
+            perf["speedup_vs_bruteforce"] = round(brute_ms / max(faiss_ms, 1e-6), 2)
+    return {"results": hits, "top_k": len(hits), "perf": perf}
 
 
 if __name__ == "__main__":
