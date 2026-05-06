@@ -141,7 +141,11 @@ class FeatureExtractor:
         优先加载 ``*.safetensors``，绕开 ``torch.load`` 的安全版本门槛；必要时回退 bin。
         """
         try:
-            return ChineseCLIPModel.from_pretrained(self.model_id, use_safetensors=True)
+            return ChineseCLIPModel.from_pretrained(
+                self.model_id,
+                use_safetensors=True,
+                low_cpu_mem_usage=True,
+            )
         except Exception as exc:  # noqa: BLE001
             if _torch_ge_26():
                 logger.warning(
@@ -149,7 +153,11 @@ class FeatureExtractor:
                     torch.__version__,
                     exc,
                 )
-                return ChineseCLIPModel.from_pretrained(self.model_id, use_safetensors=False)
+                return ChineseCLIPModel.from_pretrained(
+                    self.model_id,
+                    use_safetensors=False,
+                    low_cpu_mem_usage=True,
+                )
 
             raise RuntimeError(
                 "ChineseCLIPModel 加载失败：当前 PyTorch<2.6 时不允许走 pickle 权重加载路径（CVE-2025-32434）。\n"
@@ -244,8 +252,18 @@ class FeatureExtractor:
         alpha = max(0.0, min(1.0, alpha))
 
         img_t = self._get_image_feature_tensor(image)
-        txt_np = self.get_text_feature(text)
-        txt_t = torch.from_numpy(txt_np).to(self.device)
+        key = text.strip()
+        cached = self._text_cache.get(key)
+        if cached is not None:
+            self._text_cache.move_to_end(key)
+            txt_t = torch.from_numpy(cached).to(self.device)
+        else:
+            txt_t = self._get_text_feature_tensor(key)
+            arr = txt_t.detach().cpu().numpy().astype(np.float32)
+            self._text_cache[key] = arr.copy()
+            self._text_cache.move_to_end(key)
+            if len(self._text_cache) > self._text_cache_max_size:
+                self._text_cache.popitem(last=False)
         fused = alpha * img_t + (1.0 - alpha) * txt_t
         fused = self._l2_normalize(fused)
         return fused.detach().cpu().numpy().astype(np.float32)

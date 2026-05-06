@@ -17,14 +17,7 @@ import json
 import sys
 from pathlib import Path
 
-import faiss
-import numpy as np
-from PIL import Image
-from tqdm import tqdm
-
-from core.feature_extractor import FeatureExtractor
-
-
+# 必须在 import core 之前把项目根目录加入 sys.path（从 scripts/ 直接运行时会找不到包）
 def _project_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
@@ -35,6 +28,16 @@ def _ensure_sys_path() -> None:
         sys.path.insert(0, str(root))
 
 
+_ensure_sys_path()
+
+import faiss
+import numpy as np
+from PIL import Image
+from tqdm import tqdm
+
+from core.feature_extractor import FeatureExtractor
+
+
 def _list_image_paths(images_dir: Path) -> list[Path]:
     exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
     paths = [p for p in images_dir.iterdir() if p.is_file() and p.suffix.lower() in exts]
@@ -43,8 +46,6 @@ def _list_image_paths(images_dir: Path) -> list[Path]:
 
 
 def main() -> None:
-    _ensure_sys_path()
-
     root = _project_root()
     images_dir = root / "dataset" / "images"
     index_path = root / "dataset" / "ecommerce.index"
@@ -71,7 +72,10 @@ def main() -> None:
 
     for start in tqdm(range(0, len(paths), batch_size), desc="建库 batch"):
         batch_paths = paths[start : start + batch_size]
-        pil_list = [Image.open(p).convert("RGB") for p in batch_paths]
+        pil_list: list[Image.Image] = []
+        for p in batch_paths:
+            with Image.open(p) as im:
+                pil_list.append(im.convert("RGB"))
         feats = extractor.encode_images_batch(pil_list, batch_size=len(pil_list))
         # FAISS 要求 float32 连续内存
         feats = np.ascontiguousarray(feats, dtype=np.float32)

@@ -1,8 +1,31 @@
 """
-电商图像数据集下载脚本
-======================
+电商服饰图像数据集下载脚本
+==========================
 
-数据来源：Hugging Face ``ashraq/fashion-product-images-small``（约 4.4 万条，``split="train"`` 全量）。
+**仅用于「服饰商品图文检索 / 服饰搜索引擎」类课题**：从 Hugging Face 拉取带 ``image`` 与商品字段的服饰数据集，
+写入 ``dataset/images`` 与 ``dataset/metadata.json``。
+
+默认：``ashraq/fashion-product-images-small``（Fashion Product Images Small）。
+
+觉得缩略图偏糊时，可在**仍是服饰数据**的前提下：
+- 用 ``--min-width`` / ``--min-height`` 过滤掉过小的图；
+- 或换另一套 HF 服饰集（``--dataset mecha2019/fashion-product-images-small`` 等，字段需相近）。
+
+示例
+----
+.. code-block:: text
+
+   # 默认：服饰 ashraq 全量 train
+   python scripts/download_data.py
+
+   # 子集 + 清空旧图 + 只要偏大图（观感更好，仍是服饰）
+   python scripts/download_data.py --clean --max-rows 5000 --min-width 400 --min-height 400
+
+   # 另一套 HF 服饰数据
+   python scripts/download_data.py --dataset mecha2019/fashion-product-images-small --clean --max-rows 5000
+
+   # 答辩要更清晰主图：用 Kaggle「Fashion Product Images Dataset」完整版（非 Small），见
+   # scripts/import_kaggle_fashion_full.py
 
 网络策略
 --------
@@ -17,6 +40,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
@@ -131,22 +155,69 @@ def _image_to_rgb_pil(raw, session: requests.Session) -> Image.Image:
     return im
 
 
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="从 Hugging Face 下载服饰商品图并生成 metadata.json")
+    p.add_argument(
+        "--dataset",
+        default="ashraq/fashion-product-images-small",
+        help="HF 服饰数据集名，默认 ashraq/fashion-product-images-small",
+    )
+    p.add_argument("--split", default="train", help="数据划分名，默认 train")
+    p.add_argument(
+        "--max-rows",
+        type=int,
+        default=None,
+        help="最多处理多少条（先 shuffle 再截取，便于答辩子集）",
+    )
+    p.add_argument("--seed", type=int, default=42, help="shuffle 随机种子")
+    p.add_argument(
+        "--min-width",
+        type=int,
+        default=0,
+        help="仅保留宽不小于该值的样本（0 表示不限制；需解码图像后判断）",
+    )
+    p.add_argument(
+        "--min-height",
+        type=int,
+        default=0,
+        help="仅保留高不小于该值的样本（0 表示不限制）",
+    )
+    p.add_argument(
+        "--clean",
+        action="store_true",
+        help="开始前删除 dataset/images 下所有 .jpg（换库时建议开启）",
+    )
+    return p.parse_args()
+
+
 def main() -> None:
     _ensure_sys_path()
+    args = _parse_args()
 
     root = _project_root()
     images_dir = root / "dataset" / "images"
     metadata_path = root / "dataset" / "metadata.json"
     images_dir.mkdir(parents=True, exist_ok=True)
 
+    if args.clean:
+        removed = 0
+        for p in images_dir.glob("*.jpg"):
+            p.unlink(missing_ok=True)
+            removed += 1
+        print(f"[clean] 已删除 {removed} 个 .jpg")
+
     session = _build_session()
 
     try:
         print(
-            "正在从 Hugging Face 加载数据集（全量 train；镜像: "
+            f"正在从 Hugging Face 加载数据集 {args.dataset!r} split={args.split!r}（镜像: "
             f"{os.environ.get('HF_ENDPOINT', '默认端点')}）…"
         )
-        ds = load_dataset("ashraq/fashion-product-images-small", split="train")
+        ds = load_dataset(args.dataset, split=args.split)
+        if args.max_rows is not None and args.max_rows > 0:
+            n = min(args.max_rows, len(ds))
+            ds = ds.shuffle(seed=args.seed).select(range(n))
+            print(f"已抽样子集：{n} 条（seed={args.seed}）")
 
         try:
             total_rows = len(ds)
@@ -157,6 +228,7 @@ def main() -> None:
         written_this_run = 0
         skipped_existing = 0
         failed = 0
+        skipped_small = 0
 
         loop_start = time.perf_counter()
         last_log_time = loop_start
@@ -182,6 +254,7 @@ def main() -> None:
                     pbar.set_postfix(
                         已写入=written_this_run,
                         跳过已存在=skipped_existing,
+                        分辨率过滤=skipped_small,
                         失败=failed,
                         速度=f"{speed:.2f} img/s",
                         refresh=False,
@@ -207,18 +280,36 @@ def main() -> None:
                     skipped_existing += 1
                 else:
                     try:
-                        raw_img = _pick(row, "image")
+                        raw_img = _pick(row, "image", "Image")
                         if raw_img is None:
                             raise ValueError("无 image 字段")
 
                         pil_img = _image_to_rgb_pil(raw_img, session)
+                        w, h = pil_img.size
+                        if (args.min_width and w < args.min_width) or (args.min_height and h < args.min_height):
+                            skipped_small += 1
+                            del metadata_by_id[item_id]
+                            pbar.update(1)
+                            elapsed = time.perf_counter() - loop_start
+                            speed = (idx + 1) / elapsed if elapsed > 0 else 0.0
+                            pbar.set_postfix(
+                                已写入=written_this_run,
+                                跳过已存在=skipped_existing,
+                                分辨率过滤=skipped_small,
+                                失败=failed,
+                                速度=f"{speed:.2f} img/s",
+                                refresh=False,
+                            )
+                            continue
                         pil_img.save(out_path, format="JPEG", quality=95, optimize=True)
                         written_this_run += 1
                     except requests.RequestException as exc:
                         tqdm.write(f"[网络错误] idx={idx} id={item_id}: {exc}")
+                        metadata_by_id.pop(item_id, None)
                         failed += 1
                     except Exception as exc:
                         tqdm.write(f"[错误] idx={idx} id={item_id}: {type(exc).__name__}: {exc}")
+                        metadata_by_id.pop(item_id, None)
                         failed += 1
 
                 pbar.update(1)
@@ -227,6 +318,7 @@ def main() -> None:
                 pbar.set_postfix(
                     已写入=written_this_run,
                     跳过已存在=skipped_existing,
+                    分辨率过滤=skipped_small,
                     失败=failed,
                     速度=f"{speed:.2f} img/s",
                     refresh=False,
@@ -239,7 +331,8 @@ def main() -> None:
                     inst_speed = done_window / delta if delta > 0 else 0.0
                     tqdm.write(
                         f"[进度] {idx + 1}/{total_rows or '?'} 行 | "
-                        f"本运行新写入 {written_this_run} | 跳过 {skipped_existing} | 失败 {failed} | "
+                        f"本运行新写入 {written_this_run} | 跳过 {skipped_existing} | "
+                        f"分辨率过滤 {skipped_small} | 失败 {failed} | "
                         f"近期 {inst_speed:.2f} img/s | 累计平均 {speed:.2f} img/s"
                     )
                     last_log_time = now
@@ -254,7 +347,8 @@ def main() -> None:
         print(
             f"完成：图像目录 {images_dir}，元数据 {metadata_path}，"
             f"元数据条数 {len(metadata_list)}；"
-            f"本运行新写入 {written_this_run}，断点跳过 {skipped_existing}，失败 {failed}；"
+            f"本运行新写入 {written_this_run}，断点跳过 {skipped_existing}，"
+            f"分辨率过滤 {skipped_small}，失败 {failed}；"
             f"总耗时 {total_elapsed:.1f}s。"
         )
     finally:

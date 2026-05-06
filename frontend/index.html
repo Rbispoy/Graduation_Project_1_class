@@ -58,7 +58,7 @@
      * 2. @yeger/vue-masonry-wall：Pinterest 风格瀑布流（Vue 3 插件，全局注册 masonry-wall）。
      * 3. 调用后端 POST /api/search（multipart），展示 Top-20 卡片与相似度得分。
      */
-    import { createApp, ref, computed, watch, nextTick } from 'vue';
+    import { createApp, ref, computed, nextTick } from 'vue';
     /* external=vue：使用上方 importmap 的同一 Vue，禁止组件库内置第二份 runtime */
     import MasonryWall from 'https://esm.sh/@yeger/vue-masonry-wall@5.0.11?external=vue';
 
@@ -66,6 +66,7 @@
       setup() {
         const queryText = ref('');
         const alpha = ref(0.6);
+        const useAutoAlpha = ref(false);
         const loading = ref(false);
         const errorMsg = ref('');
         /** 与后端 `{ results: [...] }` 对齐：仅写入 payload.results 的浅拷贝，不做字段改名 */
@@ -79,20 +80,6 @@
         /** masonry 组件需要稳定 key：在每条后端记录上仅追加 _key，保留 image_url / score 等原始字段名 */
         const items = computed(() =>
           results.value.map((r, i) => ({ ...r, _key: `${r.id ?? 'row'}-${i}` })),
-        );
-
-        /** 瀑布流 slot 内调试：确认每条数据是否进入卡片 DOM 分支 */
-        function logCardItem(item) {
-          console.log('[search card] item →', item);
-          return '';
-        }
-
-        watch(
-          results,
-          (list) => {
-            console.log('[search] results ref 更新，条数=', Array.isArray(list) ? list.length : list);
-          },
-          { deep: true },
         );
 
         function onFileChange(e) {
@@ -122,6 +109,7 @@
             if (queryText.value.trim()) fd.append('query', queryText.value.trim());
             if (fileObj.value) fd.append('file', fileObj.value);
             fd.append('alpha', String(alpha.value));
+            fd.append('auto_alpha', useAutoAlpha.value && fileObj.value && queryText.value.trim() ? 'true' : 'false');
 
             fd.append('benchmark', 'true');
             const res = await fetch('./api/search', { method: 'POST', body: fd });
@@ -132,20 +120,11 @@
               throw new Error(msg || res.statusText || '请求失败');
             }
 
-            console.log('[search] 原始 JSON（应含 results 数组）→', payload);
-
-            // 后端约定：{ "results": [ ... ], "top_k": n }；禁止把整个 payload 当作列表
             const rows = Array.isArray(payload.results) ? payload.results : [];
-            if (!Array.isArray(payload.results)) {
-              console.warn('[search] payload.results 不是数组，已回退为空列表。实际 keys:', payload && typeof payload === 'object' ? Object.keys(payload) : payload);
-            }
-
-            /* 数据完整就绪后再写入；version++ 强制瀑布流实例重建 */
             results.value = rows.slice();
             perf.value = payload.perf || null;
             resultsVersion.value += 1;
             await nextTick();
-            console.log('[search] results.value 已替换为 payload.results，条数=', results.value.length, 'version=', resultsVersion.value);
           } catch (err) {
             errorMsg.value = err.message || String(err);
           } finally {
@@ -156,6 +135,7 @@
         return {
           queryText,
           alpha,
+          useAutoAlpha,
           loading,
           errorMsg,
           items,
@@ -163,7 +143,6 @@
           resultsVersion,
           perf,
           thumbUrl,
-          logCardItem,
           onFileChange,
           clearImage,
           doSearch,
@@ -241,8 +220,13 @@
                       <span class="text-violet-300">{{ alpha.toFixed(2) }}</span>
                     </div>
                     <input type="range" min="0" max="1" step="0.05" v-model.number="alpha"
-                      class="w-full accent-violet-500" />
-                    <p class="text-[11px] text-slate-600 mt-1">图文同时提供时生效：α 越大越偏向图像。</p>
+                      :disabled="useAutoAlpha"
+                      class="w-full accent-violet-500 disabled:opacity-40" />
+                    <label class="mt-2 flex items-center gap-2 text-xs text-slate-500 cursor-pointer select-none">
+                      <input type="checkbox" v-model="useAutoAlpha" class="rounded border-white/20 accent-violet-500" />
+                      <span>图文同时上传时，用<strong class="text-slate-300">自适应 α</strong>（按描述长短与图像清晰度自动融合，答辩点 B）</span>
+                    </label>
+                    <p class="text-[11px] text-slate-600 mt-1">手动模式：α 越大越偏向图像。勾选自适应后滑条仅作参考。</p>
                   </div>
                   <button
                     type="button"
@@ -261,7 +245,7 @@
             </div>
           </section>
 
-          <section v-if="perf" class="mt-6 grid sm:grid-cols-2 lg:grid-cols-4 gap-4">
+          <section v-if="perf" class="mt-6 grid sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-4">
             <div class="rounded-2xl border border-white/15 bg-slate-900/60 backdrop-blur-md p-4">
               <p class="text-xs text-slate-400">特征编码</p>
               <p class="text-xl font-semibold text-cyan-300 mt-1">{{ perf.embed_ms }} ms</p>
@@ -279,6 +263,11 @@
               <p class="text-xl font-semibold text-fuchsia-300 mt-1">
                 {{ perf.speedup_vs_bruteforce ? (perf.speedup_vs_bruteforce + 'x') : 'N/A' }}
               </p>
+            </div>
+            <div v-if="typeof perf.alpha_used === 'number'" class="rounded-2xl border border-white/15 bg-slate-900/60 backdrop-blur-md p-4">
+              <p class="text-xs text-slate-400">图文融合 α</p>
+              <p class="text-xl font-semibold text-amber-300 mt-1">{{ perf.alpha_used }}</p>
+              <p class="text-[10px] text-slate-500 mt-1">{{ perf.alpha_auto ? '自适应' : '手动滑条' }}</p>
             </div>
           </section>
 
@@ -310,9 +299,7 @@
                   class="rounded-2xl overflow-hidden border border-white/10 bg-ink-900/80 shadow-xl shadow-black/40
                          hover:border-violet-500/30 transition group"
                 >
-                  <span class="sr-only" aria-hidden="true">{{ logCardItem(item) }}</span>
                   <div class="relative aspect-[3/4] bg-black/50 overflow-hidden">
-                    <!-- 调试：文字能显示则说明 slot 数据已到 DOM；src 严格使用后端字段 image_url -->
                     <p class="absolute bottom-0 left-0 right-0 z-10 px-2 py-1 text-[10px] leading-tight text-amber-200/95 bg-black/70 line-clamp-2 border-t border-white/10">
                       {{ item.productDisplayName }}
                     </p>
@@ -321,7 +308,6 @@
                       :alt="item.productDisplayName || ''"
                       class="w-full h-full object-cover group-hover:scale-[1.03] transition duration-500"
                       loading="lazy"
-                      @error="(e) => console.warn('[search] 图片加载失败', item.image_url, e)"
                     />
                     <div
                       class="absolute top-3 right-3 px-2 py-1 rounded-lg text-[11px] font-medium
