@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>多模态电商检索 · CLIP + FAISS</title>
+  <!-- Tailwind CSS：Utility-first，快速搭建深色高级感 UI -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: { sans: ['Inter', 'system-ui', 'sans-serif'] },
+          colors: {
+            ink: { 950: '#0a0a0f', 900: '#12121a', 800: '#1a1a24' },
+          },
+        },
+      },
+    };
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <!-- 统一 Vue 解析路径，避免 esm.sh 再打一份 Vue 导致 masonry 与主应用运行时不一致（常见报错：Cannot read properties of null (reading 'isCE')） -->
+  <script type="importmap">
+  {
+    "imports": {
+      "vue": "https://unpkg.com/vue@3.4.21/dist/vue.esm-browser.js"
+    }
+  }
+  </script>
+  <style>
+    body { font-family: Inter, system-ui, sans-serif; }
+    /* 自定义滚动条，贴合深色主题 */
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-track { background: #12121a; }
+    ::-webkit-scrollbar-thumb { background: #3f3f55; border-radius: 4px; }
+  </style>
+</head>
+<body class="bg-ink-950 text-slate-200 min-h-screen antialiased">
+  <div id="app"></div>
+
+  <!-- Vue 3 运行时 + 组合式 API（ESM） -->
+  <script type="module">
+    /**
+     * 前端架构说明
+     * ----------------
+     * 1. 使用 Vue 3 CDN ESM 构建，无需 npm。
+     * 2. @yeger/vue-masonry-wall：Pinterest 风格瀑布流（Vue 3 插件，全局注册 masonry-wall）。
+     * 3. 调用后端 POST /api/search（multipart），展示 Top-20 卡片与相似度得分。
+     */
+    import { createApp, ref, computed, watch, nextTick } from 'vue';
+    /* external=vue：使用上方 importmap 的同一 Vue，禁止组件库内置第二份 runtime */
+    import MasonryWall from 'https://esm.sh/@yeger/vue-masonry-wall@5.0.11?external=vue';
+
+    createApp({
+      setup() {
+        const queryText = ref('');
+        const alpha = ref(0.6);
+        const loading = ref(false);
+        const errorMsg = ref('');
+        /** 与后端 `{ results: [...] }` 对齐：仅写入 payload.results 的浅拷贝，不做字段改名 */
+        const results = ref([]);
+        /** 每次搜索成功后递增，挂载到 masonry-wall :key，强制重建子树避免缓存旧 DOM */
+        const resultsVersion = ref(0);
+        const thumbUrl = ref('');
+        const fileObj = ref(null);
+
+        /** masonry 组件需要稳定 key：在每条后端记录上仅追加 _key，保留 image_url / score 等原始字段名 */
+        const items = computed(() =>
+          results.value.map((r, i) => ({ ...r, _key: `${r.id ?? 'row'}-${i}` })),
+        );
+
+        /** 瀑布流 slot 内调试：确认每条数据是否进入卡片 DOM 分支 */
+        function logCardItem(item) {
+          console.log('[search card] item →', item);
+          return '';
+        }
+
+        watch(
+          results,
+          (list) => {
+            console.log('[search] results ref 更新，条数=', Array.isArray(list) ? list.length : list);
+          },
+          { deep: true },
+        );
+
+        function onFileChange(e) {
+          const f = e.target.files?.[0];
+          fileObj.value = f || null;
+          if (thumbUrl.value) URL.revokeObjectURL(thumbUrl.value);
+          thumbUrl.value = f ? URL.createObjectURL(f) : '';
+        }
+
+        function clearImage() {
+          fileObj.value = null;
+          if (thumbUrl.value) URL.revokeObjectURL(thumbUrl.value);
+          thumbUrl.value = '';
+          const input = document.getElementById('file-input');
+          if (input) input.value = '';
+        }
+
+        async function doSearch() {
+          errorMsg.value = '';
+          /* 每次发起检索前先清空结果，避免 masonry 在旧/空数据切换时出现异常 vnode */
+          results.value = [];
+          await nextTick();
+          loading.value = true;
+          try {
+            const fd = new FormData();
+            if (queryText.value.trim()) fd.append('query', queryText.value.trim());
+            if (fileObj.value) fd.append('file', fileObj.value);
+            fd.append('alpha', String(alpha.value));
+
+            const res = await fetch('/api/search', { method: 'POST', body: fd });
+            const payload = await res.json().catch(() => ({}));
+            if (!res.ok) {
+              const d = payload.detail;
+              const msg = typeof d === 'string' ? d : (Array.isArray(d) ? d.map((x) => x.msg || x).join('; ') : JSON.stringify(d));
+              throw new Error(msg || res.statusText || '请求失败');
+            }
+
+            console.log('[search] 原始 JSON（应含 results 数组）→', payload);
+
+            // 后端约定：{ "results": [ ... ], "top_k": n }；禁止把整个 payload 当作列表
+            const rows = Array.isArray(payload.results) ? payload.results : [];
+            if (!Array.isArray(payload.results)) {
+              console.warn('[search] payload.results 不是数组，已回退为空列表。实际 keys:', payload && typeof payload === 'object' ? Object.keys(payload) : payload);
+            }
+
+            /* 数据完整就绪后再写入；version++ 强制瀑布流实例重建 */
+            results.value = rows.slice();
+            resultsVersion.value += 1;
+            await nextTick();
+            console.log('[search] results.value 已替换为 payload.results，条数=', results.value.length, 'version=', resultsVersion.value);
+          } catch (err) {
+            errorMsg.value = err.message || String(err);
+          } finally {
+            loading.value = false;
+          }
+        }
+
+        return {
+          queryText,
+          alpha,
+          loading,
+          errorMsg,
+          items,
+          results,
+          resultsVersion,
+          thumbUrl,
+          logCardItem,
+          onFileChange,
+          clearImage,
+          doSearch,
+        };
+      },
+      template: `
+        <div class="max-w-[1600px] mx-auto px-4 sm:px-8 pb-20">
+          <!-- 顶部品牌区 -->
+          <header class="pt-10 pb-8 text-center">
+            <p class="text-xs uppercase tracking-[0.35em] text-violet-400/90 mb-3">Multimodal Retrieval</p>
+            <h1 class="text-3xl sm:text-4xl font-semibold text-white tracking-tight">
+              电商图文联合检索
+            </h1>
+            <p class="mt-3 text-sm text-slate-400 max-w-2xl mx-auto leading-relaxed">
+              基于 <span class="text-violet-300">Chinese CLIP</span>
+              对齐图文语义空间，<span class="text-fuchsia-300">FAISS</span> 内积索引加速；
+              支持纯文本、纯图像与加权联合查询。
+            </p>
+          </header>
+
+          <!-- 大号搜索区：左图右文 -->
+          <section
+            class="rounded-3xl border border-white/10 bg-gradient-to-br from-ink-900/90 to-ink-950/90
+                   shadow-[0_0_0_1px_rgba(255,255,255,0.04),0_24px_80px_rgba(0,0,0,0.55)] backdrop-blur-xl p-6 sm:p-10"
+          >
+            <div class="grid lg:grid-cols-2 gap-8 lg:gap-12 items-stretch">
+              <!-- 左侧：上传 + 预览 -->
+              <div class="flex flex-col gap-4">
+                <div class="flex items-center justify-between">
+                  <label class="text-sm font-medium text-slate-300">查询图像</label>
+                  <button
+                    v-if="thumbUrl"
+                    type="button"
+                    class="text-xs text-slate-500 hover:text-rose-400 transition"
+                    @click="clearImage"
+                  >清除</button>
+                </div>
+                <label
+                  class="relative flex flex-1 min-h-[220px] cursor-pointer group rounded-2xl border border-dashed border-white/15
+                         hover:border-violet-500/50 bg-ink-950/40 overflow-hidden transition"
+                >
+                  <input id="file-input" type="file" accept="image/*" class="hidden" @change="onFileChange" />
+                  <div v-if="!thumbUrl" class="m-auto text-center px-6 py-12">
+                    <div class="inline-flex h-14 w-14 items-center justify-center rounded-2xl bg-violet-500/10 text-violet-300 mb-4 group-hover:scale-105 transition">
+                      <svg xmlns="http://www.w3.org/2000/svg" class="h-7 w-7" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+                          d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                      </svg>
+                    </div>
+                    <p class="text-slate-400 text-sm">点击或拖拽上传图片</p>
+                    <p class="text-slate-600 text-xs mt-2">支持 JPG / PNG · 可与右侧文本联合检索</p>
+                  </div>
+                  <img v-else :src="thumbUrl" alt="preview" class="absolute inset-0 w-full h-full object-contain bg-black/40" />
+                </label>
+              </div>
+
+              <!-- 右侧：文本 + 参数 + 搜索 -->
+              <div class="flex flex-col gap-5">
+                <div class="flex flex-col gap-2 flex-1">
+                  <label for="q" class="text-sm font-medium text-slate-300">查询文本（中文）</label>
+                  <textarea
+                    id="q"
+                    v-model="queryText"
+                    rows="6"
+                    placeholder="例如：宽松纯棉短袖、复古牛仔裤、儿童运动鞋…"
+                    class="w-full flex-1 min-h-[160px] rounded-2xl bg-ink-950/60 border border-white/10 px-4 py-3 text-sm
+                           text-slate-100 placeholder:text-slate-600 focus:outline-none focus:ring-2 focus:ring-violet-500/40 resize-y"
+                  ></textarea>
+                </div>
+
+                <div class="flex flex-col sm:flex-row sm:items-center gap-4">
+                  <div class="flex-1">
+                    <div class="flex justify-between text-xs text-slate-500 mb-1">
+                      <span>联合权重 α（图像）</span>
+                      <span class="text-violet-300">{{ alpha.toFixed(2) }}</span>
+                    </div>
+                    <input type="range" min="0" max="1" step="0.05" v-model.number="alpha"
+                      class="w-full accent-violet-500" />
+                    <p class="text-[11px] text-slate-600 mt-1">图文同时提供时生效：α 越大越偏向图像。</p>
+                  </div>
+                  <button
+                    type="button"
+                    @click="doSearch"
+                    :disabled="loading"
+                    class="shrink-0 px-8 py-3 rounded-2xl font-semibold text-sm tracking-wide
+                           bg-gradient-to-r from-violet-600 to-fuchsia-600 hover:from-violet-500 hover:to-fuchsia-500
+                           text-white shadow-lg shadow-violet-900/40 disabled:opacity-50 disabled:cursor-not-allowed transition"
+                  >
+                    {{ loading ? '检索中…' : '搜索' }}
+                  </button>
+                </div>
+
+                <p v-if="errorMsg" class="text-sm text-rose-400">{{ errorMsg }}</p>
+              </div>
+            </div>
+          </section>
+
+          <!-- 瀑布流结果 -->
+          <section class="mt-14">
+            <div class="flex items-end justify-between gap-4 mb-6">
+              <div>
+                <h2 class="text-lg font-semibold text-white">检索结果</h2>
+                <p class="text-xs text-slate-500 mt-1">Top-20 · 相似度为内积得分（L2 归一化下等价余弦相似度）</p>
+              </div>
+              <span class="text-xs text-slate-600">{{ results.length }} 条</span>
+            </div>
+
+            <!-- 有检索结果后再挂载瀑布流，避免 items 为空或未就绪时子组件内部访问 null vnode -->
+            <div v-if="results.length > 0" class="w-full">
+              <masonry-wall
+                :key="'mw-' + resultsVersion"
+                :items="items"
+                :column-width="280"
+                :gap="20"
+                :min-columns="1"
+                :max-columns="5"
+                :ssr-columns="1"
+                class="w-full"
+              >
+              <template #default="{ item }">
+                <article
+                  v-if="item"
+                  class="rounded-2xl overflow-hidden border border-white/10 bg-ink-900/80 shadow-xl shadow-black/40
+                         hover:border-violet-500/30 transition group"
+                >
+                  <span class="sr-only" aria-hidden="true">{{ logCardItem(item) }}</span>
+                  <div class="relative aspect-[3/4] bg-black/50 overflow-hidden">
+                    <!-- 调试：文字能显示则说明 slot 数据已到 DOM；src 严格使用后端字段 image_url -->
+                    <p class="absolute bottom-0 left-0 right-0 z-10 px-2 py-1 text-[10px] leading-tight text-amber-200/95 bg-black/70 line-clamp-2 border-t border-white/10">
+                      {{ item.productDisplayName }}
+                    </p>
+                    <img
+                      :src="item.image_url"
+                      :alt="item.productDisplayName || ''"
+                      class="w-full h-full object-cover group-hover:scale-[1.03] transition duration-500"
+                      loading="lazy"
+                      @error="(e) => console.warn('[search] 图片加载失败', item.image_url, e)"
+                    />
+                    <div
+                      class="absolute top-3 right-3 px-2 py-1 rounded-lg text-[11px] font-medium
+                             bg-black/55 text-emerald-300 border border-white/10 backdrop-blur-sm"
+                    >
+                      {{ Number(item.score ?? 0).toFixed(4) }}
+                    </div>
+                  </div>
+                  <div class="p-4 space-y-2">
+                    <h3 class="text-sm font-medium text-slate-100 line-clamp-2 leading-snug">
+                      {{ item.productDisplayName || '未命名商品' }}
+                    </h3>
+                    <p class="text-[11px] text-slate-500">
+                      <span class="text-violet-400/90">{{ item.masterCategory || '—' }}</span>
+                      <span class="mx-1 text-slate-700">/</span>
+                      <span>{{ item.subCategory || '—' }}</span>
+                    </p>
+                  </div>
+                </article>
+              </template>
+              </masonry-wall>
+            </div>
+
+            <div
+              v-else-if="!loading"
+              class="text-center py-24 rounded-3xl border border-dashed border-white/10 text-slate-600 text-sm"
+            >
+              上传图片或输入文本后点击搜索，结果将以瀑布流展示。
+            </div>
+          </section>
+
+          <footer class="mt-20 text-center text-[11px] text-slate-600">
+            OFA-Sys/chinese-clip-vit-base-patch16 · IndexFlatIP · 本地离线检索
+          </footer>
+        </div>
+      `,
+    })
+      .use(MasonryWall)
+      .mount('#app');
+  </script>
+</body>
+</html>
