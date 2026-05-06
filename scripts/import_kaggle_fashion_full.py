@@ -72,13 +72,22 @@ def _load_image_map(images_csv: Path) -> dict[str, str]:
     return out
 
 
+def _normalize_rel_from_csv(rel: str) -> str:
+    """images.csv 里常见 ``images/62/xxx.jpg``；而 ``--images-dir`` 已指向 images 文件夹时需去掉前缀。"""
+    rel = rel.replace("\\", "/").lstrip("/")
+    lower = rel.lower()
+    if lower.startswith("images/"):
+        rel = rel[7:]
+    return rel
+
+
 def _resolve_image_path(
     images_dir: Path,
     item_id: str,
     id_to_file: dict[str, str],
 ) -> Path | None:
     if item_id in id_to_file:
-        rel = id_to_file[item_id].replace("\\", "/").lstrip("/")
+        rel = _normalize_rel_from_csv(id_to_file[item_id])
         p = images_dir / rel
         if p.is_file():
             return p

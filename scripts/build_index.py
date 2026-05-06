@@ -13,6 +13,16 @@ FAISS 向量索引构建脚本
 
 from __future__ import annotations
 
+# 须在任何 huggingface / transformers 相关 import 之前，与 main.py 一致，避免直连 huggingface.co 被墙/断连
+import os
+
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "120")
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "600")
+os.environ["HTTP_PROXY"] = ""
+os.environ["HTTPS_PROXY"] = ""
+os.environ.setdefault("TORCH_FORCE_SAFE_LOAD", "0")
+
 import json
 import sys
 from pathlib import Path

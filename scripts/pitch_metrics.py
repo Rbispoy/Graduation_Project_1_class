@@ -15,6 +15,14 @@
 
 from __future__ import annotations
 
+import os
+
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "120")
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "600")
+os.environ["HTTP_PROXY"] = ""
+os.environ["HTTPS_PROXY"] = ""
+
 import argparse
 import json
 import random
