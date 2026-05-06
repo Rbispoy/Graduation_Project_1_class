@@ -216,11 +216,3 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
-
-# --- 多模态检索项目专用排除 ---
-# 排除所有存放图片的文件夹
-dataset/
-# 排除生成的 FAISS 索引文件
-*.index
-# 排除映射关系和元数据 JSON（因为它们是根据本地路径生成的）
-dataset/*.json
