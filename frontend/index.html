@@ -224,7 +224,7 @@
                       class="w-full accent-violet-500 disabled:opacity-40" />
                     <label class="mt-2 flex items-center gap-2 text-xs text-slate-500 cursor-pointer select-none">
                       <input type="checkbox" v-model="useAutoAlpha" class="rounded border-white/20 accent-violet-500" />
-                      <span>图文同时上传时，用<strong class="text-slate-300">自适应 α</strong>（按描述长短与图像清晰度自动融合，答辩点 B）</span>
+                      <span>图文同时输入时启用<strong class="text-slate-300">自适应融合</strong>（依据文本详略与图像清晰度自动确定模态权重 α，无需手调滑条）</span>
                     </label>
                     <p class="text-[11px] text-slate-600 mt-1">手动模式：α 越大越偏向图像。勾选自适应后滑条仅作参考。</p>
                   </div>
